@@ -29,9 +29,9 @@ async def main():
 
     # directories
     base_dir = Path.cwd()
-    dataset_dir = base_dir / 'dataset'
-    zip_dir = dataset_dir / 'files_zip'
-    parquet_dir = dataset_dir / 'processed_parquet'
+    dataset_dir = base_dir / f'dataset_{symbol}_{interval}'
+    zip_dir = dataset_dir / f'files_zip_{symbol}_{interval}'
+    parquet_dir = dataset_dir / f'processed_parquet_{symbol}_{interval}'
     
     # Create directories
     dataset_dir.mkdir(exist_ok=True)
@@ -43,7 +43,7 @@ async def main():
     prefix = f"data/{data_type}/{frequency}/klines/{symbol}/{interval}/"
     files_df, start_date_fetch, end_date_fetch = data_fetcher.fetch_available_files(base_url, prefix, symbol, interval)
 
-    files_df_filtered = data_fetcher.filter_by_date_range(files_df, start_date, end_date)
+    files_df_filtered = data_fetcher.filter_by_date_range(files_df, str(start_date_fetch), str(end_date_fetch))
 
     # Set File Info
     file_name = f"info_binance_{data_type}_{frequency}_{symbol}_{interval}_files"
