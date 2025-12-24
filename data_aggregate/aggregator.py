@@ -1,11 +1,11 @@
 """
-OHLCV aggregation engine.
+OHLCV data aggregation.
 
-Provides aggregation of OHLCV data from any source timeframe
+Provides high-accuracy aggregation of OHLCV data from any source timeframe
 to any target timeframe, with automatic timestamp format detection and handling.
 """
 
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Union, Literal
 import polars as pl
 
 from data_aggregate.timestamp_utils import (
@@ -17,9 +17,242 @@ from data_aggregate.timestamp_utils import (
 from data_aggregate.config import DEFAULT_OHLCV_COLUMNS, OPTIONAL_COLUMNS
 
 
+def detect_source_interval(
+    df: pl.DataFrame,
+    timestamp_col: str = 'open_time',
+    sample_size: int = 1000
+) -> int:
+    """
+    Automatically detect the source data interval in seconds.
+    
+    Analyzes the time differences between consecutive timestamps to determine
+    the data granularity (e.g., 1s, 1m, 1h, etc.).
+    
+    Args:
+        df: Input DataFrame with timestamp column
+        timestamp_col: Name of the timestamp column
+        sample_size: Number of samples to analyze (default: 1000)
+        
+    Returns:
+        Detected interval in seconds (e.g., 1 for 1s data, 60 for 1m data)
+        
+    Raises:
+        ValueError: If interval cannot be reliably detected
+        
+    Example:
+        >>> df = pl.read_parquet("BTCUSDT-1s-2024-11.parquet")
+        >>> interval = detect_source_interval(df)
+        >>> print(interval)  # Output: 1
+    """
+    if timestamp_col not in df.columns:
+        raise ValueError(f"Timestamp column '{timestamp_col}' not found in DataFrame")
+    
+    if len(df) < 2:
+        raise ValueError("DataFrame must have at least 2 rows to detect interval")
+    
+    # Detect and normalize timestamp format first
+    original_format = detect_timestamp_format(df, timestamp_col)
+    df_normalized, _ = normalize_timestamp_to_datetime(df, timestamp_col, original_format)
+    
+    # Sort by timestamp to ensure correct difference calculation
+    df_sorted = df_normalized.sort(timestamp_col)
+    
+    # Sample the data for efficiency
+    n_samples = min(sample_size, len(df_sorted) - 1)
+    df_sample = df_sorted.head(n_samples + 1)
+    
+    # Calculate time differences in seconds
+    time_diffs = (
+        df_sample
+        .select([
+            timestamp_col,
+            pl.col(timestamp_col).diff().dt.total_seconds().alias('diff_seconds')
+        ])
+        .filter(pl.col('diff_seconds').is_not_null())
+        ['diff_seconds']
+    )
+    
+    if len(time_diffs) == 0:
+        raise ValueError("Could not calculate time differences")
+    
+    # Use the mode (most common difference) as the interval
+    # This handles occasional gaps in the data
+    mode_diff = time_diffs.mode().to_list()[0]
+    
+    # Round to nearest integer second
+    interval_seconds = int(round(mode_diff))
+    
+    if interval_seconds <= 0:
+        raise ValueError(f"Invalid interval detected: {interval_seconds} seconds")
+    
+    return interval_seconds
+
+
+def aggregate_ohlcv(
+    df: pl.DataFrame,
+    target_intervals: Union[Dict[str, int], str, int],
+    source_interval: Optional[Union[int, str]] = None,
+    timestamp_col: str = 'open_time',
+    output_format: Literal['datetime', 'ms', 'us', 's', 'auto'] = 'auto'
+) -> Union[pl.DataFrame, Dict[str, pl.DataFrame]]:
+    """
+    Aggregate OHLCV data to higher timeframe(s) with automatic detection.
+    
+    This is the main functional API that works without class instantiation.
+    Automatically detects source interval, handles all timestamp formats including
+    Binance quirks, and works with any exchange data.
+    
+    Features:
+        - Auto-detects source data interval (no manual specification needed)
+        - Auto-detects and fixes timestamp format issues (including Binance quirks)
+        - Works with any timestamp format (seconds, milliseconds, microseconds, datetime)
+        - Single or multiple target intervals in one call
+        - Flexible output format options
+    
+    Args:
+        df: Source DataFrame with OHLCV data
+        target_intervals: Target interval(s) to aggregate to. Can be:
+            - Dict[str, int]: Multiple intervals {'5m': 300, '1h': 3600}
+            - str: Single interval from STANDARD_INTERVALS like '5m', '1h'
+            - int: Single interval in seconds like 300, 3600
+        source_interval: Optional source interval specification. Can be:
+            - None: Auto-detect from data (recommended)
+            - int: Interval in seconds (e.g., 1, 60)
+            - str: Interval name (e.g., '1s', '1m') from STANDARD_INTERVALS
+        timestamp_col: Name of the timestamp column (default: 'open_time')
+        output_format: Output timestamp format:
+            - 'auto': Keep original format (default)
+            - 'datetime': Convert to datetime[ms]
+            - 'ms': Convert to milliseconds (int)
+            - 'us': Convert to microseconds (int)
+            - 's': Convert to seconds (int)
+            
+    Returns:
+        - If target_intervals is Dict: Dict[str, pl.DataFrame] with multiple aggregations
+        - If target_intervals is str/int: Single pl.DataFrame
+        
+    Raises:
+        ValueError: If parameters are invalid or intervals are incompatible
+        
+    Examples:
+        >>> # Auto-detect everything, aggregate to multiple timeframes
+        >>> df = pl.read_parquet("BTCUSDT-1s-2024-11.parquet")
+        >>> result = aggregate_ohlcv(df, {'5m': 300, '1h': 3600})
+        >>> df_5m = result['5m']
+        >>> df_1h = result['1h']
+        
+        >>> # Using interval names from STANDARD_INTERVALS
+        >>> from data_aggregate import STANDARD_INTERVALS
+        >>> intervals = {k: STANDARD_INTERVALS[k] for k in ['5m', '1h', '4h']}
+        >>> result = aggregate_ohlcv(df, intervals)
+        
+        >>> # Single interval aggregation
+        >>> df_5m = aggregate_ohlcv(df, 300)  # or aggregate_ohlcv(df, '5m')
+        
+        >>> # Specify source interval manually (if auto-detection fails)
+        >>> result = aggregate_ohlcv(df, {'1h': 3600}, source_interval=60)
+        
+        >>> # Get output as Unix milliseconds
+        >>> df_5m = aggregate_ohlcv(df, 300, output_format='ms')
+    """
+    from data_aggregate.config import STANDARD_INTERVALS
+    
+    # Validate DataFrame
+    if len(df) == 0:
+        raise ValueError("Input DataFrame is empty")
+    
+    # Auto-detect source interval if not provided
+    if source_interval is None:
+        detected_interval = detect_source_interval(df, timestamp_col)
+        source_interval_seconds = detected_interval
+    else:
+        # Parse source interval if provided as string
+        if isinstance(source_interval, str):
+            if source_interval not in STANDARD_INTERVALS:
+                raise ValueError(
+                    f"Unknown source interval: '{source_interval}'. "
+                    f"Valid options: {list(STANDARD_INTERVALS.keys())}"
+                )
+            source_interval_seconds = STANDARD_INTERVALS[source_interval]
+        else:
+            source_interval_seconds = source_interval
+    
+    # Parse target intervals
+    return_single = False
+    if isinstance(target_intervals, dict):
+        # Multiple intervals provided
+        target_dict = target_intervals
+    elif isinstance(target_intervals, str):
+        # Single interval as string
+        if target_intervals not in STANDARD_INTERVALS:
+            raise ValueError(
+                f"Unknown target interval: '{target_intervals}'. "
+                f"Valid options: {list(STANDARD_INTERVALS.keys())}"
+            )
+        target_dict = {target_intervals: STANDARD_INTERVALS[target_intervals]}
+        return_single = True
+    elif isinstance(target_intervals, int):
+        # Single interval as integer seconds
+        target_dict = {f'{target_intervals}s': target_intervals}
+        return_single = True
+    else:
+        raise ValueError(
+            f"Invalid target_intervals type: {type(target_intervals)}. "
+            "Expected Dict[str, int], str, or int"
+        )
+    
+    # Determine preserve_original_format based on output_format
+    if output_format == 'auto':
+        preserve_original_format = True
+        force_output_format = None
+    elif output_format == 'datetime':
+        preserve_original_format = False
+        force_output_format = TimestampFormat.DATETIME_MS
+    elif output_format == 'ms':
+        preserve_original_format = False
+        force_output_format = TimestampFormat.MILLISECONDS
+    elif output_format == 'us':
+        preserve_original_format = False
+        force_output_format = TimestampFormat.MICROSECONDS
+    elif output_format == 's':
+        preserve_original_format = False
+        force_output_format = TimestampFormat.SECONDS
+    else:
+        raise ValueError(
+            f"Invalid output_format: '{output_format}'. "
+            "Valid options: 'auto', 'datetime', 'ms', 'us', 's'"
+        )
+    
+    # Create aggregator instance (internal use)
+    aggregator = OHLCVAggregator(
+        source_interval_seconds=source_interval_seconds,
+        timestamp_col=timestamp_col
+    )
+    
+    # Perform aggregation
+    results = aggregator.aggregate_multiple(
+        df,
+        target_intervals=target_dict,
+        preserve_original_format=preserve_original_format
+    )
+    
+    # Apply forced output format if specified
+    if force_output_format is not None:
+        results = {
+            name: restore_original_timestamp_format(df_agg, timestamp_col, force_output_format)
+            for name, df_agg in results.items()
+        }
+    
+    # Return single DataFrame if only one interval was requested
+    if return_single:
+        return list(results.values())[0]
+    
+    return results
+
+
 class OHLCVAggregator:
     """
-    OHLCV data aggregator.
+    High-accuracy OHLCV data aggregator.
     
     Aggregates OHLCV (Open, High, Low, Close, Volume) data from lower timeframes
     to higher timeframes with automatic timestamp format detection and handling.
@@ -79,7 +312,7 @@ class OHLCVAggregator:
         preserve_original_format: bool = True
     ) -> pl.DataFrame:
         """
-        OHLCV data to a higher timeframe.
+        Aggregate OHLCV data to a higher timeframe.
         
         Args:
             df: Source DataFrame with OHLCV data

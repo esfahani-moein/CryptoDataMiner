@@ -3,7 +3,7 @@ import os
 
 def save_df_to_parquet(df: pl.DataFrame, folder_path: str, file_name: str) -> None:
     """
-    Save a Polars DataFrame to Parquet format with ZSTD compression level 10.
+    Save a Polars DataFrame to Parquet format with ZSTD compression level 15.
     
     Args:
         df: Polars DataFrame to save
@@ -13,5 +13,5 @@ def save_df_to_parquet(df: pl.DataFrame, folder_path: str, file_name: str) -> No
     
     os.makedirs(folder_path, exist_ok=True)
     file_path = os.path.join(folder_path, file_name + '.parquet')
-    df.write_parquet(file_path, compression='zstd', compression_level=10)
+    df.write_parquet(file_path, compression='zstd', compression_level=15)
     print(f"DataFrame saved to {file_path}")
