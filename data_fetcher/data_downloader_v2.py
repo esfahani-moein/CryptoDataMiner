@@ -29,7 +29,7 @@ class DownloadOptimizer:
     def __init__(
         self,
         max_concurrent: int = 5,
-        chunk_size: int = 1024 * 1024,  # 1MB chunks
+        chunk_size: int = 1024 * 1024 * 10,  # 1MB chunks
         max_retries: int = 3,
         timeout: int = 300,  # 5 minutes
         connector_limit: int = 100
@@ -307,7 +307,9 @@ async def batch_download_multiple(
     tasks = []
     for config, df in configs_with_dfs:
         # Create subfolder for each config
-        folder_name = f"{config.symbol}_{config.data_type.value}_{config.market.value}"
+        # Replace forward slashes to prevent unwanted subdirectories
+        market_name = config.market.value.replace('/', '_')
+        folder_name = f"{config.symbol}_{config.data_type.value}_{market_name}"
         if config.interval:
             folder_name += f"_{config.interval}"
         

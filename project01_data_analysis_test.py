@@ -1,314 +1,266 @@
 """
-Enhanced Data Fetcher Examples
-Demonstrates new features: futures data, multiple symbols, smart date selection, batch downloads
+Data Processing Pipeline
+Downloads and processes Binance futures data (klines and trades)
+Uses the new enhanced data fetcher with smart monthly/daily selection
 """
 
 import os
-import asyncio
 from pathlib import Path
 import polars as pl
+import asyncio
+from data_fetcher import (
+    DataConfig,
+    DataType,
+    Market,
+    fetch_and_combine_smart,
+    batch_download_multiple
+)
+from data_processor import process_downloaded_files
 
-# Import new enhanced API
-from data_fetcher import *
 
-# =============================================================================
-# EXAMPLE 1: Download Futures Trades Data
-# =============================================================================
-async def example_1_futures_trades():
-    """Download futures trades data for BTCUSDT"""
+async def main():
+    """
+    Download and process data:
+    """
+    
+    # Configuration
+    symbol = "BTCUSDT"
+    start_date = "2025-11-01"
+    end_date = "2025-11-30"
+    klines_interval = "1m"
+    
+    num_cpu = os.cpu_count()
+    print(f"\n{'='*70}")
+    print(f"Number of CPU cores available: {num_cpu}")
+    print(f"Date range: {start_date} to {end_date}")
+    print(f"{'='*70}\n")
+    
+    num_workers = min(10, num_cpu) if num_cpu else 5
+    num_concurrent_downloads = 10
+
+    # Setup directories
+    base_dir = Path.cwd()
+    dataset_dir = base_dir / 'dataset'/ f'dataset_{symbol}'
+    
+    # Create main dataset directory
+    dataset_dir.mkdir(exist_ok=True, parents=True)
+    
+    # ========================================================================
+    # STEP 1: Configure Downloads (Klines + Trades)
+    # ========================================================================
     print("\n" + "="*70)
-    print("EXAMPLE 1: Futures Trades Data")
+    print("Configuring Downloads")
     print("="*70)
     
-    # Configure download
-    config = DataConfig(
-        symbol="BTCUSDT",
-        data_type=DataType.TRADES,
-        market=Market.FUTURES_UM,
-        start_date="2024-01-01",
-        end_date="2024-01-31"
-    )
-    
-    # Fetch file list with smart monthly/daily selection
-    files_df = fetch_and_combine_smart(config)
-    
-    if files_df.is_empty():
-        print("No files found!")
-        return
-    
-    # Download files
-    download_folder = Path("dataset/futures_trades_BTCUSDT")
-    stats = await download_files_df(
-        files_df,
-        str(download_folder),
-        max_concurrent=5,
-        max_retries=3
-    )
-    
-    print(f"\nDownload stats: {stats}")
-
-
-# =============================================================================
-# EXAMPLE 2: Download Futures BookTicker Data
-# =============================================================================
-async def example_2_futures_bookticker():
-    """Download futures bookTicker data"""
-    print("\n" + "="*70)
-    print("EXAMPLE 2: Futures BookTicker Data")
-    print("="*70)
-    
-    config = DataConfig(
-        symbol="ETHUSDT",
-        data_type=DataType.BOOK_TICKER,
-        market=Market.FUTURES_UM,
-        start_date="2024-06-01",
-        end_date="2024-06-30"
-    )
-    
-    files_df = fetch_and_combine_smart(config)
-    
-    if files_df.is_empty():
-        print("No files found!")
-        return
-    
-    download_folder = Path("dataset/futures_bookticker_ETHUSDT")
-    stats = await download_files_df(files_df, str(download_folder), max_concurrent=5)
-    
-    print(f"\nDownload stats: {stats}")
-
-
-# =============================================================================
-# EXAMPLE 3: Smart Monthly/Daily Selection
-# =============================================================================
-async def example_3_smart_date_selection():
-    """
-    Demonstrate smart monthly/daily selection
-    Date range: 2024-05-03 to 2024-11-20
-    - May 3-31: Daily
-    - June-October: Monthly
-    - November 1-20: Daily
-    """
-    print("\n" + "="*70)
-    print("EXAMPLE 3: Smart Monthly/Daily Selection")
-    print("="*70)
-    
-    config = DataConfig(
-        symbol="SOLUSDT",
-        data_type=DataType.KLINES,
-        market=Market.SPOT,
-        interval="1h",
-        start_date="2024-05-03",
-        end_date="2024-11-20"
-    )
-    
-    # This will automatically use monthly for full months, daily for partial months
-    files_df = fetch_and_combine_smart(config)
-    
-    if files_df.is_empty():
-        print("No files found!")
-        return
-    
-    # Show breakdown by frequency
-    print("\nFiles by frequency:")
-    print(files_df.group_by('frequency').agg([
-        pl.count('filename').alias('count'),
-        (pl.col('size_bytes').sum() / (1024**2)).alias('size_mb')
-    ]))
-    
-    download_folder = Path("dataset/spot_klines_SOLUSDT_1h")
-    stats = await download_files_df(files_df, str(download_folder), max_concurrent=5)
-    
-    print(f"\nDownload stats: {stats}")
-
-
-# =============================================================================
-# EXAMPLE 4: Multiple Downloads (Batch Processing)
-# =============================================================================
-async def example_4_batch_download():
-    """
-    Download multiple symbols and data types concurrently
-    """
-    print("\n" + "="*70)
-    print("EXAMPLE 4: Batch Download Multiple Configurations")
-    print("="*70)
-    
-    # Define multiple download configurations
     configs = [
-        # BTCUSDT klines
+        
         DataConfig(
-            symbol="BTCUSDT",
-            data_type=DataType.KLINES,
-            market=Market.SPOT,
-            interval="1m",
-            start_date="2024-08-01",
-            end_date="2024-08-31"
-        ),
-        # SOLUSDT trades
-        DataConfig(
-            symbol="SOLUSDT",
-            data_type=DataType.TRADES,
-            market=Market.SPOT,
-            start_date="2024-08-01",
-            end_date="2024-08-15"
-        ),
-        # ETHUSDT futures klines
-        DataConfig(
-            symbol="ETHUSDT",
+            symbol=symbol,
             data_type=DataType.KLINES,
             market=Market.FUTURES_UM,
-            interval="5m",
-            start_date="2024-08-01",
-            end_date="2024-08-31"
-        )
-    ]
-    
-    # Fetch file lists for all configs
-    configs_with_dfs = []
-    for config in configs:
-        print(f"\nFetching files for {config.symbol} - {config.data_type.value}...")
-        files_df = fetch_and_combine_smart(config)
-        if not files_df.is_empty():
-            configs_with_dfs.append((config, files_df))
-    
-    # Batch download all configurations
-    base_folder = "dataset/batch_download"
-    results = await batch_download_multiple(
-        configs_with_dfs,
-        base_folder,
-        max_concurrent_per_config=3,
-        max_concurrent_configs=2
-    )
-    
-    # Print summary
-    print("\n" + "="*70)
-    print("BATCH DOWNLOAD SUMMARY")
-    print("="*70)
-    for (config, _), result in zip(configs_with_dfs, results):
-        print(f"\n{config.symbol} - {config.data_type.value} ({config.market.value}):")
-        print(f"  Files: {result['successful']}/{result['total_files']}")
-        print(f"  Speed: {result['avg_speed_mbps']:.2f} MB/s")
-        print(f"  Time: {result['elapsed_time']:.2f}s")
+            interval=klines_interval,
+            start_date=start_date,
+            end_date=end_date
+        ),
 
-
-# =============================================================================
-# EXAMPLE 5: All Futures Data Types for One Symbol
-# =============================================================================
-async def example_5_all_futures_data_types():
-    """Download multiple data types for same symbol"""
-    print("\n" + "="*70)
-    print("EXAMPLE 5: All Futures Data Types for BTCUSDT")
-    print("="*70)
-    
-    symbol = "BTCUSDT"
-    start_date = "2024-12-01"
-    end_date = "2024-12-31"
-    
-    # Define all futures data types to download
-    data_types_configs = [
-        (DataType.KLINES, "1m"),       # Klines need interval
-        (DataType.TRADES, None),       # Trades don't need interval
-        (DataType.AGG_TRADES, None),
-        (DataType.BOOK_TICKER, None),
-    ]
-    
-    configs_with_dfs = []
-    
-    for data_type, interval in data_types_configs:
-        config = DataConfig(
+        DataConfig(
             symbol=symbol,
-            data_type=data_type,
+            data_type=DataType.KLINES,
+            market=Market.SPOT,
+            interval=klines_interval,
+            start_date=start_date,
+            end_date=end_date
+        ),
+        
+        DataConfig(
+            symbol=symbol,
+            data_type=DataType.TRADES,
             market=Market.FUTURES_UM,
             start_date=start_date,
-            end_date=end_date,
-            interval=interval
+            end_date=end_date
         )
-        
-        print(f"\nFetching {data_type.value}...")
+    ]
+    
+    print(f"Configured {len(configs)} download tasks:")
+    for config in configs:
+        if config.interval:
+            print(f"  - {config.symbol} {config.data_type.value} ({config.interval})")
+        else:
+            print(f"  - {config.symbol} {config.data_type.value}")
+    
+    # ========================================================================
+    # STEP 2: Fetch File Lists (Smart Monthly/Daily Selection)
+    # ========================================================================
+    print("\n" + "="*70)
+    print("Fetching File Lists")
+    print("="*70)
+    
+    configs_with_dfs = []
+    for config in configs:
+        print(f"\nFetching files for {config.symbol} {config.data_type.value}...")
         files_df = fetch_and_combine_smart(config)
         
         if not files_df.is_empty():
             configs_with_dfs.append((config, files_df))
+            print(f"Found {len(files_df)} files for {config.symbol} {config.data_type.value}")
+        else:
+            print(f"No files found for {config.symbol} {config.data_type.value}")
     
-    # Batch download
-    base_folder = f"dataset/{symbol}_futures_complete"
-    results = await batch_download_multiple(
-        configs_with_dfs,
-        base_folder,
-        max_concurrent_per_config=3,
-        max_concurrent_configs=2
-    )
-
-
-# =============================================================================
-# EXAMPLE 6: Custom Download with Progress Tracking
-# =============================================================================
-async def example_6_custom_optimization():
-    """Demonstrate custom optimization settings"""
-    print("\n" + "="*70)
-    print("EXAMPLE 6: Custom Optimization Settings")
-    print("="*70)
-    
-    config = DataConfig(
-        symbol="BTCUSDT",
-        data_type=DataType.KLINES,
-        market=Market.SPOT,
-        interval="1s",
-        start_date="2024-08-01",
-        end_date="2024-08-31"
-    )
-    
-    files_df = fetch_and_combine_smart(config)
-    
-    if files_df.is_empty():
-        print("No files found!")
+    if not configs_with_dfs:
+        print("\n[!] No files to download. Exiting.")
         return
     
-    # Custom optimization: larger chunks, more concurrent downloads
-    download_folder = Path("dataset/btc_1s_optimized")
-    stats = await download_files_df(
-        files_df,
-        str(download_folder),
-        max_concurrent=10,           # More concurrent downloads
-        chunk_size=5 * 1024 * 1024,  # 5MB chunks (larger for big files)
-        max_retries=5                # More retries for reliability
-    )
+    # ========================================================================
+    # STEP 3: Check Existing Files and Download Missing Ones
+    # ========================================================================
+    print("\n" + "="*70)
+    print("Checking Existing Files and Downloading Missing Ones")
+    print("="*70)
     
-    print(f"\nDownload stats: {stats}")
-
-
-# =============================================================================
-# Main Function
-# =============================================================================
-async def main():
-    """Run examples"""
+    # Filter out already downloaded files
+    configs_with_filtered_dfs = []
+    for config, files_df in configs_with_dfs:
+        # Determine download directory (replace slashes to prevent subfolders)
+        market_name = config.market.value.replace('/', '_')
+        folder_name = f"{config.symbol}_{config.data_type.value}_{market_name}"
+        if config.interval:
+            folder_name += f"_{config.interval}"
+        
+        download_dir = dataset_dir / folder_name
+        
+        # Check which files already exist with correct size
+        if download_dir.exists():
+            existing_files = set()
+            files_to_download = []
+            
+            for row in files_df.iter_rows(named=True):
+                filename = row['filename']
+                expected_size = row['size_bytes']
+                file_path = download_dir / filename
+                
+                if file_path.exists():
+                    actual_size = file_path.stat().st_size
+                    if actual_size == expected_size:
+                        existing_files.add(filename)
+                    else:
+                        files_to_download.append(row)
+                else:
+                    files_to_download.append(row)
+            
+            if existing_files:
+                print(f"\n[+] {config.symbol} {config.data_type.value}:")
+                print(f"    Already downloaded: {len(existing_files)} files")
+                print(f"    Need to download: {len(files_to_download)} files")
+            
+            if files_to_download:
+                # Create filtered DataFrame with only files to download
+                filtered_df = pl.DataFrame(files_to_download)
+                configs_with_filtered_dfs.append((config, filtered_df))
+            else:
+                print(f"    [+] All files already exist, skipping download")
+        else:
+            # Directory doesn't exist, download all files
+            configs_with_filtered_dfs.append((config, files_df))
     
+    # Download missing files
+    if configs_with_filtered_dfs:
+        results = await batch_download_multiple(
+            configs_with_filtered_dfs,
+            str(dataset_dir),
+            max_concurrent_per_config=num_concurrent_downloads,
+            max_concurrent_configs=2  # Download both types concurrently
+        )
+    else:
+        print("\n[+] All files already downloaded, skipping download step")
+        results = []
+    
+    # Print download summary
+    if results:
+        print("\n" + "="*70)
+        print("DOWNLOAD SUMMARY")
+        print("="*70)
+        total_files = 0
+        total_successful = 0
+        for (config, _), result in zip(configs_with_filtered_dfs, results):
+            data_type_name = config.data_type.value
+            if config.interval:
+                data_type_name += f" ({config.interval})"
+            
+            print(f"\n{config.symbol} - {data_type_name}:")
+            print(f"  Files: {result['successful']}/{result['total_files']}")
+            print(f"  Speed: {result['avg_speed_mbps']:.2f} MB/s")
+            print(f"  Time: {result['elapsed_time']:.2f}s")
+            
+            total_files += result['total_files']
+            total_successful += result['successful']
+        
+        print(f"\n{'='*70}")
+        print(f"TOTAL: {total_successful}/{total_files} files downloaded successfully")
+        print(f"{'='*70}\n")
+    
+    # ========================================================================
+    # Processing Files to Parquet
+    # ========================================================================
+    print("\n" + "="*70)
+    print("Processing Files to Parquet")
+    print("="*70)
+    
+    for config, files_df in configs_with_dfs:
+        # Determine directory for this config
+        market_name = config.market.value.replace('/', '_')
+        folder_name = f"{config.symbol}_{config.data_type.value}_{market_name}"
+        if config.interval:
+            folder_name += f"_{config.interval}"
+        
+        zip_dir = dataset_dir / folder_name
+        parquet_dir = zip_dir  # Save parquet files in same directory as zip files
+        
+        parquet_dir.mkdir(exist_ok=True)
+        
+        # Check if zip directory exists and has files
+        if not zip_dir.exists():
+            print(f"[!] Directory not found: {zip_dir}")
+            continue
+        
+        zip_files = list(zip_dir.glob("*.zip"))
+        if not zip_files:
+            print(f"[!] No ZIP files found in: {zip_dir}")
+            continue
+        
+        print(f"\nProcessing {config.symbol} {config.data_type.value}...")
+        print(f"  Source: {zip_dir}")
+        print(f"  Destination: {parquet_dir}")
+        print(f"  Files to process: {len(zip_files)}")
+        
+        try:
+            # Process files to parquet
+            result = process_downloaded_files(
+                local_folder=str(zip_dir),
+                files_df=files_df,
+                data_type=config.data_type.value,
+                save_folder=str(parquet_dir),
+                max_workers=num_workers
+            )
+            
+            if result:
+                print(f"[+] Processed {result['successful']}/{result['total']} files successfully")
+                if result['failed'] > 0:
+                    print(f"[!] {result['failed']} files failed")
+                print(f"    Output: {parquet_dir}")
+            
+        except Exception as e:
+            print(f"[X] Error processing {config.data_type.value}: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # ========================================================================
+    # FINAL SUMMARY
+    # ========================================================================
     print("\n" + "#"*70)
-    print("# Enhanced Data Fetcher Examples")
+    print("# PIPELINE COMPLETE!")
     print("#"*70)
-    
-    # Uncomment the examples you want to run:
-    
-    # Example 1: Futures trades
-    # await example_1_futures_trades()
-    
-    # Example 2: Futures bookTicker
-    # await example_2_futures_bookticker()
-    
-    # Example 3: Smart date selection
-    # await example_3_smart_date_selection()
-    
-    # Example 4: Batch download multiple configs
-    await example_4_batch_download()
-    
-    # Example 5: All data types for one symbol
-    # await example_5_all_futures_data_types()
-    
-    # Example 6: Custom optimization
-    # await example_6_custom_optimization()
-    
-    print("\n" + "#"*70)
-    print("# Examples Complete!")
-    print("#"*70 + "\n")
+    print(f"\nAll data saved in: {dataset_dir}")
+    print("\n" + "#"*70 + "\n")
 
 
 if __name__ == "__main__":
