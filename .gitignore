@@ -8,3 +8,4 @@ dataset/
 .env
 .env.*
 .DS_Store
+*.md
