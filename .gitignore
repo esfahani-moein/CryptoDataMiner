@@ -9,3 +9,4 @@ dataset/
 .env.*
 .DS_Store
 *.md
+examples/
