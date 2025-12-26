@@ -195,6 +195,12 @@ def aggregate_trades_to_tick_imbalance_bars(
     exp_num_ticks = float(exp_num_ticks_init)
     exp_buy_proportion = 0.5  # Initial assumption: balanced
     
+    # Calculate initial threshold (updated after each bar forms)
+    buy_imbalance_factor = abs(2 * exp_buy_proportion - 1)
+    if buy_imbalance_factor < 0.01:  # Handle balanced market
+        buy_imbalance_factor = 0.01
+    expected_imbalance = exp_num_ticks * buy_imbalance_factor * 1.0
+    
     # Bar data accumulators
     bar_ids = []
     open_times = []
@@ -257,19 +263,7 @@ def aggregate_trades_to_tick_imbalance_bars(
         # Track individual tick imbalances for EMA calculation
         imbalance_history.append(signed_tick)
         
-        # Calculate expected imbalance threshold
-        # E[T] × |2P[b=1] - 1| × E[v]
-        # For tick bars: E[v] = 1
-        buy_imbalance_factor = abs(2 * exp_buy_proportion - 1)
-        
-        # CRITICAL FIX: Handle balanced market case
-        # If market is perfectly balanced, use minimum threshold
-        if buy_imbalance_factor < 0.01:  # Market is nearly balanced
-            buy_imbalance_factor = 0.01  # Minimum threshold to avoid noise
-        
-        expected_imbalance = exp_num_ticks * buy_imbalance_factor * 1.0
-        
-        # Check if bar should be formed
+        # Check if bar should be formed (threshold calculated ONCE per bar)
         if abs(theta) >= expected_imbalance:
             # Save bar
             bar_ids.append(bar_id)
@@ -296,6 +290,10 @@ def aggregate_trades_to_tick_imbalance_bars(
                 window = min(num_ticks_ewma_window, len(ticks_per_bar_history))
                 recent_ticks = ticks_per_bar_history[-window:]
                 exp_num_ticks = _calculate_ema(np.array(recent_ticks), window)
+                
+                # CRITICAL: Prevent death spiral - don't let exp_num_ticks drop too low
+                # Minimum should be reasonable (at least 10% of initial estimate)
+                exp_num_ticks = max(exp_num_ticks, exp_num_ticks_init * 0.1)
             
             # Update expected buy proportion using EMA
             if len(imbalance_history) > 10:  # Need some history
@@ -315,6 +313,12 @@ def aggregate_trades_to_tick_imbalance_bars(
                 
                 # Ensure valid range [0.1, 0.9] to avoid extremes
                 exp_buy_proportion = max(0.1, min(0.9, exp_buy_proportion))
+            
+            # Calculate threshold for NEXT bar (NO LOOK-AHEAD)
+            buy_imbalance_factor = abs(2 * exp_buy_proportion - 1)
+            if buy_imbalance_factor < 0.01:  # Handle balanced market
+                buy_imbalance_factor = 0.01
+            expected_imbalance = exp_num_ticks * buy_imbalance_factor * 1.0
             
             # Reset for next bar
             bar_id += 1
@@ -432,6 +436,12 @@ def aggregate_trades_to_dollar_imbalance_bars(
     exp_buy_proportion = 0.5
     exp_dollar_value = float(np.mean(quote_quantities[:1000])) if len(quote_quantities) > 1000 else float(quote_quantities[0])
     
+    # Calculate initial threshold (updated after each bar forms)
+    buy_imbalance_factor = abs(2 * exp_buy_proportion - 1)
+    if buy_imbalance_factor < 0.01:  # Handle balanced market
+        buy_imbalance_factor = 0.01
+    expected_imbalance = exp_num_ticks * buy_imbalance_factor * exp_dollar_value
+    
     # Bar data
     bar_ids = []
     open_times = []
@@ -494,14 +504,7 @@ def aggregate_trades_to_dollar_imbalance_bars(
         imbalance_history.append(float(tick_rules[i]))
         dollar_values_history.append(dollar_value)
         
-        # Calculate threshold
-        buy_imbalance_factor = abs(2 * exp_buy_proportion - 1)
-        if buy_imbalance_factor < 0.01:
-            buy_imbalance_factor = 0.01
-        
-        expected_imbalance = exp_num_ticks * buy_imbalance_factor * exp_dollar_value
-        
-        # Check bar formation
+        # Check bar formation (threshold calculated ONCE per bar)
         if abs(theta) >= expected_imbalance:
             # Save bar
             bar_ids.append(bar_id)
@@ -526,6 +529,9 @@ def aggregate_trades_to_dollar_imbalance_bars(
                 window = min(num_ticks_ewma_window, len(ticks_per_bar_history))
                 recent_ticks = ticks_per_bar_history[-window:]
                 exp_num_ticks = _calculate_ema(np.array(recent_ticks), window)
+                
+                # CRITICAL: Prevent death spiral - don't let exp_num_ticks drop too low
+                exp_num_ticks = max(exp_num_ticks, exp_num_ticks_init * 0.1)
             
             if len(imbalance_history) > 10:
                 window_size = int(num_prev_bars * exp_num_ticks)
@@ -543,6 +549,12 @@ def aggregate_trades_to_dollar_imbalance_bars(
                 window_size = max(10, min(window_size, len(dollar_values_history)))
                 recent_values = dollar_values_history[-window_size:]
                 exp_dollar_value = _calculate_ema(np.array(recent_values), min(20, len(recent_values)))
+            
+            # Calculate threshold for NEXT bar (NO LOOK-AHEAD)
+            buy_imbalance_factor = abs(2 * exp_buy_proportion - 1)
+            if buy_imbalance_factor < 0.01:  # Handle balanced market
+                buy_imbalance_factor = 0.01
+            expected_imbalance = exp_num_ticks * buy_imbalance_factor * exp_dollar_value
             
             # Reset
             bar_id += 1
