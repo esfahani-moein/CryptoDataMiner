@@ -1,6 +1,15 @@
 
 
 import polars as pl
+import warnings
+
+# DEPRECATION WARNING
+warnings.warn(
+    "data_processor/data_types.py is deprecated. "
+    "Use data_fetcher.binance_config.get_data_type_schema() instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 def get_data_config(data_type: str) -> dict:
     """

@@ -8,7 +8,7 @@ from .data_types import get_data_config
 import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from src.data_save import save_df_to_parquet
+from .data_save import save_df_to_parquet
 
 
 def process_single_file(zip_path: str, config: dict, local_folder: str, save_folder: str = None) -> bool:

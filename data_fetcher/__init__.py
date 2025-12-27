@@ -1,14 +1,10 @@
 
 """
 Data Fetcher Module
-Supports downloading data from Binance repositories with smart monthly/daily selection with priorithy to monthly data.
+Supports downloading data from Binance repositories with smart monthly/daily selection with priority to monthly data.
 """
 
-# Backward compatibility - old API
-from .data_info_loader import fetch_available_files, filter_by_date_range
-from .data_downloader import download_files_df
-
-# enhanced API
+# Enhanced API (recommended)
 from .binance_config import (
     DataConfig,
     Market,
@@ -29,12 +25,7 @@ from .data_downloader_v2 import (
 )
 
 __all__ = [
-    # Old API (backward compatibility)
-    'fetch_available_files',
-    'filter_by_date_range',
-    
-    
-    # New API
+    # Enhanced API
     'DataConfig',
     'Market',
     'DataType',
