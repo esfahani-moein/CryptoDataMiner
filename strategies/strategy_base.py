@@ -491,7 +491,8 @@ class StrategyBase(ABC):
         # Step 3: Create labels
         if verbose:
             print("\n[STEP 3] Creating labels...")
-        df = self.create_labels(df, horizon=1, threshold=0.001)
+        # Use smaller threshold for more balanced classes
+        df = self.create_labels(df, horizon=1, threshold=0.0001)
         
         # Step 4: Split data
         if verbose:
