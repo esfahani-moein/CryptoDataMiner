@@ -45,9 +45,11 @@ class StrategyResult:
     profit_factor: float
     calmar_ratio: float
     sortino_ratio: float
+    n_trades: int = 0
+    n_days: int = 0
     
     # Additional info
-    train_time_seconds: float
+    train_time_seconds: float = 0.0
     feature_importance: Dict[str, float] = field(default_factory=dict)
     model_params: Dict[str, Any] = field(default_factory=dict)
     confusion_matrix: Optional[np.ndarray] = None
@@ -128,6 +130,7 @@ class StrategyBase(ABC):
             '30min': 30,
             '1hr': 60,
             '4hr': 240,
+            'dollar': 5,  # Default for dollar bars
         }
         return mapping.get(self.timeframe, 5)
     
@@ -231,7 +234,8 @@ class StrategyBase(ABC):
                 start_year=self.start_year, start_month=self.start_month,
                 end_year=self.end_year, end_month=self.end_month
             )
-            df = merge_features_to_ohlcv(df, funding, "calc_time")
+            # load_funding_rate renames calc_time to time
+            df = merge_features_to_ohlcv(df, funding, "time")
             print(f"    Merged {len(funding):,} funding records")
         except Exception as e:
             print(f"    Warning: Could not load funding: {e}")
@@ -244,8 +248,9 @@ class StrategyBase(ABC):
                 start_year=self.start_year, start_month=self.start_month,
                 end_year=self.end_year, end_month=self.end_month
             )
-            # Standard klines format: open, high, low, close columns
+            # Standard klines format: open_time, open, high, low, close columns
             if "close" in mark_klines.columns and "open_time" in mark_klines.columns:
+                # Rename open_time to timestamp for merging
                 mark_klines = mark_klines.select(["open_time", "close"]).rename({
                     "open_time": "timestamp", 
                     "close": "mark_price"
@@ -387,58 +392,114 @@ class StrategyBase(ABC):
         y_pred: np.ndarray,
         returns: np.ndarray
     ) -> Dict[str, float]:
-        """Calculate trading performance metrics."""
-        returns = np.nan_to_num(returns, nan=0.0)
+        """
+        Calculate trading performance metrics with proper methodology.
         
-        # Strategy returns (only trade when prediction != 0)
-        strategy_returns = np.where(y_pred != 0, y_pred * returns, 0)
+        IMPORTANT: This uses a simple PnL model where:
+        - y_pred = 1 means go long (profit if price goes up)
+        - y_pred = -1 means go short (profit if price goes down)  
+        - y_pred = 0 means no position
+        
+        Note: Sharpe ratios from short test periods (< 30 days) are unreliable.
+        """
+        returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Clip extreme returns (data errors)
+        returns = np.clip(returns, -0.1, 0.1)  # Cap at ±10% per bar
+        
+        # Ensure y_pred is numeric and properly scaled
+        y_pred = np.array(y_pred, dtype=float)
+        
+        # Clip predictions to valid range
+        y_pred = np.clip(y_pred, -1, 1)
+        
+        # Strategy returns: position * forward_return
+        strategy_returns = y_pred * returns
+        
+        # Count actual trades (position changes)
+        positions = np.sign(y_pred)
+        position_changes = np.diff(np.concatenate([[0], positions]))
+        n_trades = np.sum(np.abs(position_changes) > 0)
         
         # Cumulative returns
         cum_returns = np.cumprod(1 + strategy_returns)
         total_return = cum_returns[-1] - 1 if len(cum_returns) > 0 else 0
         
-        # Sharpe ratio (annualized)
-        if len(strategy_returns) > 1 and np.std(strategy_returns) > 0:
-            daily_bars = self.bars_per_day
-            sharpe = np.mean(strategy_returns) / np.std(strategy_returns) * np.sqrt(daily_bars * 252)
+        # Aggregate to daily returns for Sharpe calculation
+        bars_per_day = self.bars_per_day
+        n_full_days = len(strategy_returns) // bars_per_day
+        
+        if n_full_days >= 5:  # Need at least 5 days for any reliability
+            daily_returns = []
+            for i in range(n_full_days):
+                start_idx = i * bars_per_day
+                end_idx = (i + 1) * bars_per_day
+                day_ret = np.prod(1 + strategy_returns[start_idx:end_idx]) - 1
+                daily_returns.append(day_ret)
+            daily_returns = np.array(daily_returns)
+            
+            # Sharpe ratio with small sample adjustment
+            if np.std(daily_returns) > 1e-10:
+                raw_sharpe = np.mean(daily_returns) / np.std(daily_returns)
+                # Annualize with small sample penalty
+                # For n < 30 days, apply sqrt(n/252) instead of sqrt(252)
+                if n_full_days < 30:
+                    sharpe = raw_sharpe * np.sqrt(n_full_days)  # Don't annualize, just scale by sample
+                else:
+                    sharpe = raw_sharpe * np.sqrt(252)  # Standard annualization
+            else:
+                sharpe = 0.0
+                
+            # Sortino ratio
+            downside_returns = daily_returns[daily_returns < 0]
+            if len(downside_returns) > 0 and np.std(downside_returns) > 1e-10:
+                raw_sortino = np.mean(daily_returns) / np.std(downside_returns)
+                if n_full_days < 30:
+                    sortino = raw_sortino * np.sqrt(n_full_days)
+                else:
+                    sortino = raw_sortino * np.sqrt(252)
+            else:
+                sortino = 0.0
         else:
-            sharpe = 0.0
+            # Not enough data - return non-annualized metrics
+            if np.std(strategy_returns) > 1e-10:
+                sharpe = np.mean(strategy_returns) / np.std(strategy_returns)
+            else:
+                sharpe = 0.0
+            sortino = 0.0
         
         # Max drawdown
         peak = np.maximum.accumulate(cum_returns)
-        drawdown = (peak - cum_returns) / peak
+        drawdown = np.where(peak > 0, (peak - cum_returns) / peak, 0)
         max_dd = np.max(drawdown) if len(drawdown) > 0 else 0
         
-        # Win rate
-        winning_trades = np.sum(strategy_returns > 0)
-        total_trades = np.sum(y_pred != 0)
-        win_rate = winning_trades / total_trades if total_trades > 0 else 0
+        # Win rate: proportion of active bars that were profitable
+        active_mask = y_pred != 0
+        if np.sum(active_mask) > 0:
+            winning_bars = np.sum((strategy_returns > 0) & active_mask)
+            total_active_bars = np.sum(active_mask)
+            win_rate = winning_bars / total_active_bars
+        else:
+            win_rate = 0.0
         
         # Profit factor
         gross_profit = np.sum(strategy_returns[strategy_returns > 0])
         gross_loss = np.abs(np.sum(strategy_returns[strategy_returns < 0]))
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
+        profit_factor = gross_profit / gross_loss if gross_loss > 1e-10 else 0
         
-        # Calmar ratio
-        calmar = total_return / max_dd if max_dd > 0 else 0
-        
-        # Sortino ratio
-        downside_returns = strategy_returns[strategy_returns < 0]
-        if len(downside_returns) > 1:
-            downside_std = np.std(downside_returns)
-            daily_bars = self.bars_per_day
-            sortino = np.mean(strategy_returns) / downside_std * np.sqrt(daily_bars * 252) if downside_std > 0 else 0
-        else:
-            sortino = 0.0
+        # Calmar ratio (return / max drawdown, not annualized for short periods)
+        calmar = total_return / max_dd if max_dd > 1e-10 else 0.0
         
         return {
-            'total_return': total_return,
-            'sharpe_ratio': sharpe,
-            'max_drawdown': max_dd,
-            'win_rate': win_rate,
-            'profit_factor': profit_factor,
-            'calmar_ratio': calmar,
-            'sortino_ratio': sortino,
+            'total_return': float(total_return),
+            'sharpe_ratio': float(sharpe),
+            'max_drawdown': float(max_dd),
+            'win_rate': float(win_rate),
+            'profit_factor': float(profit_factor),
+            'calmar_ratio': float(calmar),
+            'sortino_ratio': float(sortino),
+            'n_trades': int(n_trades),
+            'n_days': int(n_full_days),
         }
     
     def get_feature_importance(self) -> Dict[str, float]:
@@ -557,6 +618,8 @@ class StrategyBase(ABC):
             profit_factor=metrics['profit_factor'],
             calmar_ratio=metrics['calmar_ratio'],
             sortino_ratio=metrics['sortino_ratio'],
+            n_trades=metrics.get('n_trades', 0),
+            n_days=metrics.get('n_days', 0),
             train_time_seconds=train_time,
             feature_importance=importance,
             confusion_matrix=metrics.get('confusion_matrix'),

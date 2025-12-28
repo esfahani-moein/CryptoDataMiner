@@ -39,6 +39,7 @@ class DollarBarsStrategy(StrategyBase):
         self,
         symbol: str = "BTCUSDT",
         period: str = "2025_11",
+        timeframe: str = "dollar",  # Ignored, always uses dollar bars
         dollar_threshold: Optional[float] = None,  # Auto-calculated if None
         target_bars_per_day: int = 50,  # Used to calculate threshold
         **kwargs
