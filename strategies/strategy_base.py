@@ -222,7 +222,12 @@ class StrategyBase(ABC):
                 start_year=self.start_year, start_month=self.start_month,
                 end_year=self.end_year, end_month=self.end_month
             )
-            df = merge_features_to_ohlcv(df, metrics, "timestamp")
+            df = merge_features_to_ohlcv(
+                df,
+                metrics,
+                ohlcv_time_col="timestamp",
+                features_time_col="time",
+            )
             print(f"    Merged {len(metrics):,} metrics records")
         except Exception as e:
             print(f"    Warning: Could not load metrics: {e}")
@@ -235,7 +240,12 @@ class StrategyBase(ABC):
                 end_year=self.end_year, end_month=self.end_month
             )
             # load_funding_rate renames calc_time to time
-            df = merge_features_to_ohlcv(df, funding, "time")
+            df = merge_features_to_ohlcv(
+                df,
+                funding,
+                ohlcv_time_col="timestamp",
+                features_time_col="time",
+            )
             print(f"    Merged {len(funding):,} funding records")
         except Exception as e:
             print(f"    Warning: Could not load funding: {e}")
@@ -255,7 +265,12 @@ class StrategyBase(ABC):
                     "open_time": "timestamp", 
                     "close": "mark_price"
                 })
-                df = merge_features_to_ohlcv(df, mark_klines, "timestamp")
+                df = merge_features_to_ohlcv(
+                    df,
+                    mark_klines,
+                    ohlcv_time_col="timestamp",
+                    features_time_col="timestamp",
+                )
                 print(f"    Merged mark price data")
         except Exception as e:
             print(f"    Warning: Could not load mark price: {e}")
@@ -266,7 +281,11 @@ class StrategyBase(ABC):
         self,
         df: pl.DataFrame,
         horizon: int = None,
-        threshold: float = 0.001
+        threshold: float = 0.001,
+        mode: str = "fixed",
+        vol_col: str = "vol_10",
+        vol_k: float = 1.0,
+        cost_bps: float = 0.0
     ) -> pl.DataFrame:
         """Create classification labels."""
         from quant_features.labeling import (
@@ -281,10 +300,25 @@ class StrategyBase(ABC):
         
         # Create classification labels
         ret_col = f"fwd_ret_{horizon}"
+
+        # Cost proxy (simple): convert bps to return units.
+        # Note: forward returns are log returns by default; for small values,
+        # log-return and simple-return are very close.
+        cost = float(cost_bps) / 10000.0
+
+        if mode == "fixed":
+            thr_expr = pl.lit(float(threshold) + cost)
+        elif mode in {"vol", "volatility"}:
+            if vol_col not in df.columns:
+                raise ValueError(f"vol_col='{vol_col}' not found in df columns")
+            thr_expr = (pl.col(vol_col) * float(vol_k) + cost)
+        else:
+            raise ValueError(f"Unknown label mode: {mode}. Use 'fixed' or 'vol'.")
+
         df = df.with_columns([
-            pl.when(pl.col(ret_col) > threshold)
+            pl.when(pl.col(ret_col) > thr_expr)
             .then(pl.lit(1))
-            .when(pl.col(ret_col) < -threshold)
+            .when(pl.col(ret_col) < -thr_expr)
             .then(pl.lit(-1))
             .otherwise(pl.lit(0))
             .alias("label")
@@ -294,6 +328,44 @@ class StrategyBase(ABC):
         df = add_sample_weights(df, return_col=ret_col)
         
         return df
+
+    def get_label_params(self) -> Dict[str, Any]:
+        """Label configuration used by run(). Override per-strategy if needed."""
+        # Keep defaults conservative to avoid breaking existing behavior.
+        return {
+            "horizon": 1,
+            # The runner previously forced 1e-4; keep that as default.
+            "threshold": 0.0001,
+            "mode": "fixed",
+            "vol_col": "vol_10",
+            "vol_k": 1.0,
+            "cost_bps": self.get_trading_cost_bps(),
+        }
+
+    def get_trading_cost_bps(self) -> float:
+        """Approximate per-unit turnover cost in basis points (fees+slippage)."""
+        # Conservative, rough defaults for crypto perp intraday backtests.
+        # This is applied per unit of turnover (0->1 costs 1 unit, 1->-1 costs 2 units).
+        tf = self.timeframe
+        if tf == "1min":
+            return 2.0
+        if tf == "5min":
+            return 1.5
+        if tf == "15min":
+            return 1.0
+        if tf == "1hr":
+            return 0.5
+        return 1.0
+
+    def _drop_invalid_rows(self, df: pl.DataFrame, required_cols: List[str]) -> pl.DataFrame:
+        """Drop rows with nulls in required columns (warmup + forward-return tail)."""
+        existing = [c for c in required_cols if c in df.columns]
+        if not existing:
+            return df
+
+        return df.filter(
+            pl.all_horizontal([pl.col(c).is_not_null() for c in existing])
+        )
     
     def time_series_split(
         self,
@@ -365,16 +437,27 @@ class StrategyBase(ABC):
         recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
         f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
         
+        auc = 0.5
         try:
-            if y_prob.ndim == 2 and y_prob.shape[1] > 2:
-                auc = roc_auc_score(y_true, y_prob, multi_class='ovr', average='weighted')
-            else:
-                auc = roc_auc_score(y_true, y_prob[:, 1] if y_prob.ndim == 2 else y_prob)
+            classes = np.unique(y_true)
+            if y_prob.ndim == 2:
+                if len(classes) == 2 and y_prob.shape[1] >= 2:
+                    # Map y_true to 0/1 using sorted class order.
+                    neg, pos = np.sort(classes)[0], np.sort(classes)[1]
+                    y01 = (y_true == pos).astype(int)
+                    auc = roc_auc_score(y01, y_prob[:, 1])
+                elif len(classes) >= 3 and y_prob.shape[1] == len(classes):
+                    auc = roc_auc_score(y_true, y_prob, multi_class='ovr', average='weighted', labels=list(classes))
         except Exception:
             auc = 0.5
         
         # Trading metrics
-        trading_metrics = self._calculate_trading_metrics(y_true, y_pred, returns)
+        trading_metrics = self._calculate_trading_metrics(
+            y_true,
+            y_pred,
+            returns,
+            cost_bps=self.get_trading_cost_bps(),
+        )
         
         return {
             'accuracy': accuracy,
@@ -390,7 +473,8 @@ class StrategyBase(ABC):
         self,
         y_true: np.ndarray,
         y_pred: np.ndarray,
-        returns: np.ndarray
+        returns: np.ndarray,
+        cost_bps: float = 0.0
     ) -> Dict[str, float]:
         """
         Calculate trading performance metrics with proper methodology.
@@ -420,6 +504,13 @@ class StrategyBase(ABC):
         positions = np.sign(y_pred)
         position_changes = np.diff(np.concatenate([[0], positions]))
         n_trades = np.sum(np.abs(position_changes) > 0)
+
+        # Simple transaction cost model: charge cost per unit turnover.
+        # 0 -> 1 costs 1 unit, 1 -> -1 costs 2 units, etc.
+        if cost_bps and cost_bps > 0:
+            cost_per_unit = float(cost_bps) / 10000.0
+            turnover_units = np.abs(position_changes)
+            strategy_returns = strategy_returns - turnover_units * cost_per_unit
         
         # Cumulative returns
         cum_returns = np.cumprod(1 + strategy_returns)
@@ -552,8 +643,23 @@ class StrategyBase(ABC):
         # Step 3: Create labels
         if verbose:
             print("\n[STEP 3] Creating labels...")
-        # Use smaller threshold for more balanced classes
-        df = self.create_labels(df, horizon=1, threshold=0.0001)
+
+        label_params = self.get_label_params()
+        df = self.create_labels(
+            df,
+            horizon=label_params.get("horizon", 1),
+            threshold=label_params.get("threshold", 0.0001),
+            mode=label_params.get("mode", "fixed"),
+            vol_col=label_params.get("vol_col", "vol_10"),
+            vol_k=label_params.get("vol_k", 1.0),
+            cost_bps=label_params.get("cost_bps", self.get_trading_cost_bps()),
+        )
+
+        # Drop warmup rows (rolling NaNs) and tail rows (forward return NaNs)
+        required_cols = list(set(available_features + ["label", f"fwd_ret_{label_params.get('horizon', 1)}"]))
+        if "sample_weight" in df.columns:
+            required_cols.append("sample_weight")
+        df = self._drop_invalid_rows(df, required_cols)
         
         # Step 4: Split data
         if verbose:
@@ -587,8 +693,9 @@ class StrategyBase(ABC):
         y_pred, y_prob = self.predict(X_test)
         
         # Get forward returns for trading metrics
-        if "fwd_ret_1" in test_df.columns:
-            test_returns = test_df["fwd_ret_1"].to_numpy()
+        fwd_col = f"fwd_ret_{label_params.get('horizon', 1)}"
+        if fwd_col in test_df.columns:
+            test_returns = test_df[fwd_col].to_numpy()
         else:
             test_returns = np.zeros(len(y_test))
         test_returns = np.nan_to_num(test_returns, nan=0.0)

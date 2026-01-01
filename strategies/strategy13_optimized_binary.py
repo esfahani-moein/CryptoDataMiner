@@ -14,7 +14,7 @@ from typing import List, Tuple, Optional, Any, Dict
 from sklearn.preprocessing import LabelEncoder, StandardScaler, RobustScaler
 from sklearn.feature_selection import SelectKBest, mutual_info_classif
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.model_selection import cross_val_score, TimeSeriesSplit
 
 import sys
 from pathlib import Path
@@ -60,6 +60,60 @@ class OptimizedBinaryStrategy(StrategyBase):
     
     def get_name(self) -> str:
         return f"Optimized_Binary_{self.n_features}feat_{self.timeframe}"
+
+    def create_labels(
+        self,
+        df: pl.DataFrame,
+        horizon: int = None,
+        threshold: float = 0.0,
+        mode: str = "fixed",
+        vol_col: str = "vol_10",
+        vol_k: float = 1.0,
+        cost_bps: float = 0.0,
+    ) -> pl.DataFrame:
+        """Event-driven labels.
+
+        We label only when the move is large enough to clear costs + threshold.
+        - Long:  fwd_ret >  (threshold + cost)
+        - Short: fwd_ret < -(threshold + cost)
+        - Hold:  otherwise (label=0)
+
+        Training then uses only non-zero events (binary), which avoids the
+        "always short" class imbalance that happens on 1min.
+        """
+        from quant_features.labeling import add_forward_returns, add_sample_weights
+
+        if horizon is None:
+            horizon = 1
+
+        df = add_forward_returns(df, periods=[horizon])
+        ret_col = f"fwd_ret_{horizon}"
+        cost = float(cost_bps) / 10000.0
+
+        thr = float(threshold) + cost
+        df = df.with_columns([
+            pl.when(pl.col(ret_col) > thr).then(pl.lit(1))
+            .when(pl.col(ret_col) < -thr).then(pl.lit(-1))
+            .otherwise(pl.lit(0))
+            .alias("label")
+        ])
+
+        df = add_sample_weights(df, return_col=ret_col)
+        return df
+
+    def get_label_params(self) -> Dict[str, Any]:
+        # Horizon: scale with timeframe.
+        tfm = self.timeframe_minutes
+        horizon = max(1, int(round(30 / tfm)))  # ~30 minutes lookahead
+
+        # Threshold: very small by default; costs are applied inside create_labels.
+        # You can raise this to reduce events (trade frequency).
+        return {
+            "horizon": horizon,
+            "threshold": 0.00005,
+            "mode": "fixed",
+            "cost_bps": self.get_trading_cost_bps(),
+        }
     
     def get_feature_columns(self) -> List[str]:
         return [
@@ -238,6 +292,21 @@ class OptimizedBinaryStrategy(StrategyBase):
         """Train with feature selection and probability calibration."""
         from sklearn.utils.class_weight import compute_sample_weight
         
+        # Train only on events (exclude hold=0)
+        train_mask = (y_train != 0)
+        val_mask = (y_val != 0)
+
+        X_train = X_train[train_mask]
+        y_train = y_train[train_mask]
+        if sample_weights is not None:
+            sample_weights = sample_weights[train_mask]
+
+        X_val = X_val[val_mask]
+        y_val = y_val[val_mask]
+
+        if len(np.unique(y_train)) < 2:
+            raise ValueError("Not enough label diversity after event filtering; increase data or lower threshold.")
+
         # Binary encoding
         y_train_enc = self.label_encoder.fit_transform(y_train)
         y_val_enc = self.label_encoder.transform(y_val)
@@ -293,9 +362,12 @@ class OptimizedBinaryStrategy(StrategyBase):
             )
         
         # Cross-validation score on training data
-        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-        cv_scores = cross_val_score(model, X_train_sel, y_train_enc, cv=cv, scoring='roc_auc')
-        print(f"  CV AUC: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+        try:
+            cv = TimeSeriesSplit(n_splits=3)
+            cv_scores = cross_val_score(model, X_train_sel, y_train_enc, cv=cv, scoring='roc_auc')
+            print(f"  TS-CV AUC: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+        except Exception as e:
+            print(f"  TS-CV skipped: {e}")
         
         # Final training with sample weights
         try:
@@ -325,20 +397,26 @@ class OptimizedBinaryStrategy(StrategyBase):
         # Get probabilities
         probas = self.model.predict_proba(X_selected)
         
-        # Apply probability threshold
-        # probas[:, 1] is probability of positive class (encoded)
-        predictions = np.zeros(len(X), dtype=int)
-        
+        # If model is binary (trained on events), interpret probability of class "+1"
+        # and apply a confidence threshold; otherwise hold.
+        conf = np.max(probas, axis=1)
+
         if len(self.label_encoder.classes_) == 2:
-            # Binary: use threshold
-            predictions = np.where(probas[:, 1] > self.probability_threshold, 1, 0)
-        else:
-            # Multi-class: use argmax
-            predictions = np.argmax(probas, axis=1)
-        
-        # Decode
-        predictions = self.label_encoder.inverse_transform(predictions)
-        return predictions, probas
+            # Determine which encoded index corresponds to +1
+            classes = list(self.label_encoder.classes_)
+            try:
+                pos_idx = classes.index(1)
+            except ValueError:
+                pos_idx = 1
+
+            pred_enc = np.argmax(probas, axis=1)
+            pred = self.label_encoder.inverse_transform(pred_enc)
+            pred = np.where(conf >= self.probability_threshold, pred, 0)
+            return pred, probas
+
+        pred_enc = np.argmax(probas, axis=1)
+        pred = self.label_encoder.inverse_transform(pred_enc)
+        return pred, probas
     
     def get_feature_importance(self) -> Dict[str, float]:
         """Get feature importance for selected features."""
