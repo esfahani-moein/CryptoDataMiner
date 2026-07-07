@@ -11,3 +11,4 @@ dataset/
 *.md
 examples/
 results/
+.github
