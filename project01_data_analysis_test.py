@@ -157,7 +157,7 @@ async def main():
                 filtered_df = pl.DataFrame(files_to_download)
                 configs_with_filtered_dfs.append((config, filtered_df))
             else:
-                print(f"    [+] All files already exist, skipping download")
+                print("    [+] All files already exist, skipping download")
         else:
             # Directory doesn't exist, download all files
             configs_with_filtered_dfs.append((config, files_df))

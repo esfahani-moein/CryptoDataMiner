@@ -13,12 +13,12 @@ from .binance_config import (
     BinanceDataRepository,
     get_data_type_schema
 )
-from .data_info_loader_v2 import (
+from .data_info_loader import (
     fetch_files_for_config,
     fetch_and_combine_smart,
     determine_optimal_frequency
 )
-from .data_downloader_v2 import (
+from .data_downloader import (
     download_files_df,
     batch_download_multiple,
     DownloadOptimizer
